@@ -13,7 +13,7 @@ fn responses_reasoning_content_never_pollutes_structured_answer_text() {
         ]}}),
     ];
     let wire: String = events.iter().map(|e| format!("data: {e}\n\n")).collect();
-    for provider in [Provider::Openai, Provider::Xai, Provider::Openrouter] {
+    for provider in [Provider::Openai, Provider::Codex, Provider::Openrouter] {
         let mut deltas = Vec::new();
         let response = decode(provider, "test", Cursor::new(&wire), |event| {
             deltas.push(event);

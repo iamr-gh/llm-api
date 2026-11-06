@@ -14,7 +14,7 @@ fn sse(events: &[Value]) -> String {
 
 #[test]
 fn reasoning_options_are_preserved_and_core_fields_cannot_be_overridden() {
-    for provider in [Provider::Openai, Provider::Xai, Provider::Openrouter] {
+    for provider in [Provider::Openai, Provider::Codex, Provider::Openrouter] {
         let req = request(
             json!({"reasoning":{"effort":"high","summary":"auto"},"model":"wrong","stream":false,"store":true}),
         );
@@ -31,15 +31,6 @@ fn reasoning_options_are_preserved_and_core_fields_cannot_be_overridden() {
     let wire = encode(Provider::Anthropic, &req).unwrap();
     assert_eq!(wire["thinking"], req.options["thinking"]);
     assert_eq!(wire["output_config"]["effort"], "high");
-    let req = request(
-        json!({"generationConfig":{"thinkingConfig":{"thinkingBudget":1024,"includeThoughts":true},"temperature":0.5}}),
-    );
-    let wire = encode(Provider::Gemini, &req).unwrap();
-    assert_eq!(
-        wire["generationConfig"]["thinkingConfig"],
-        req.options["generationConfig"]["thinkingConfig"]
-    );
-    assert_eq!(wire["generationConfig"]["maxOutputTokens"], 2048);
 }
 
 #[test]
@@ -121,20 +112,6 @@ fn parallel_tools_and_redacted_thinking_survive_anthropic_replay() {
     assert_eq!(
         encoded["messages"][1]["content"][0],
         json!({"type":"redacted_thinking","data":"opaque"})
-    );
-}
-
-#[test]
-fn gemini_keeps_usage_after_finish_and_native_signatures() {
-    let wire = sse(&[
-        json!({"candidates":[{"content":{"parts":[{"text":"hello","thoughtSignature":"opaque"}]},"finishReason":"STOP"}]}),
-        json!({"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":2}}),
-    ]);
-    let response = decode(Provider::Gemini, "test", Cursor::new(wire), |_| true).unwrap();
-    assert_eq!(response.usage["normalized"]["input_tokens"], 10);
-    assert_eq!(
-        response.message.replay.unwrap()["data"]["parts"][0]["thoughtSignature"],
-        "opaque"
     );
 }
 

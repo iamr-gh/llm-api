@@ -9,6 +9,7 @@ import subprocess
 import urllib.error
 import urllib.request
 import zlib
+import codex_session
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -17,17 +18,22 @@ def environment():
     env = os.environ.copy()
     for line in (ROOT / ".env").read_text().splitlines():
         key, separator, value = line.strip().removeprefix("export ").partition("=")
-        if separator and key.strip() in ("OPENAI_API_KEY", "OPENROUTER_API_KEY"):
+        if separator and key.strip() in ("OPENAI_API_KEY", "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY"):
             env[key.strip()] = value.strip().strip("\"'")
     return env
 
 
 def models(provider, env):
+    if provider == "codex":
+        return codex_session.models(env)
     host, key = {
         "openai": ("https://api.openai.com/v1/models", "OPENAI_API_KEY"),
         "openrouter": ("https://openrouter.ai/api/v1/models", "OPENROUTER_API_KEY"),
+        "anthropic": ("https://api.anthropic.com/v1/models", "ANTHROPIC_API_KEY"),
     }[provider]
-    request = urllib.request.Request(host, headers={"Authorization": "Bearer " + env[key]})
+    headers = ({"x-api-key": env[key], "anthropic-version": "2023-06-01"}
+               if provider == "anthropic" else {"Authorization": "Bearer " + env[key]})
+    request = urllib.request.Request(host, headers=headers)
     with urllib.request.urlopen(request, timeout=30) as response:
         return json.load(response)["data"]
 
@@ -39,22 +45,29 @@ def free(model):
     )
 
 
-def catalog(env):
-    entries = models("openrouter", env)
-    for entry in sorted(filter(free, entries), key=lambda m: m.get("created", 0), reverse=True):
-        print(json.dumps({"provider": "openrouter", "id": entry["id"],
-                          "modalities": entry.get("architecture", {}).get("input_modalities"),
-                          "parameters": entry.get("supported_parameters"),
-                          "pricing": entry["pricing"]}))
-    entries = models("openai", env)
-    for entry in sorted(entries, key=lambda m: m.get("created", 0), reverse=True):
-        if any(part in entry["id"] for part in ("nano", "mini")):
-            print(json.dumps({"provider": "openai", "id": entry["id"], "created": entry.get("created")}))
+def catalog(env, selected=None):
+    for provider in ([selected] if selected else ["openai", "anthropic", "openrouter"]):
+        entries = models(provider, env)
+        for entry in sorted(entries, key=lambda m: m.get("created", 0), reverse=True):
+            if provider == "openrouter" and not free(entry):
+                continue
+            if provider == "openai" and not any(part in entry["id"] for part in ("nano", "mini")):
+                continue
+            if provider == "codex" and entry.get("visibility") != "list":
+                continue
+            print(json.dumps({"provider": provider, "id": entry.get("id", entry.get("slug")),
+                              "pricing": entry.get("pricing"),
+                              "modalities": entry.get("architecture", {}).get("input_modalities"),
+                              "parameters": entry.get("supported_parameters")}))
 
 
 class Session:
     def __init__(self, env, provider, model):
         self.provider, self.model = provider, model
+        self.adaptive_thinking = False
+        if provider == "anthropic":
+            info = next(m for m in models(provider, env) if m["id"] == model)
+            self.adaptive_thinking = info["capabilities"]["thinking"]["types"]["adaptive"]["supported"]
         self.process = subprocess.Popen([str(ROOT / "target/release/llm-api")], env=env,
                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=subprocess.PIPE, text=True, bufsize=1)
@@ -64,6 +77,8 @@ class Session:
 
     def call(self, name, messages, **options):
         request = {"model": self.model, "messages": messages, "max_tokens": 256, **options}
+        if self.provider == "codex":
+            request.setdefault("options", {}).setdefault("reasoning", {"effort": "low", "summary": "auto"})
         command = {"provider": self.provider, "request": request}
         self.process.stdin.write(json.dumps(command) + "\n")
         self.process.stdin.flush()
@@ -109,8 +124,8 @@ def text(response):
 def image():
     def chunk(kind, payload):
         return struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", zlib.crc32(kind + payload))
-    raw = (b"\x00" + b"\xff\x00\x00" * 32) * 32
-    png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 32, 32, 8, 2, 0, 0, 0))
+    raw = (b"\x00" + b"\xff\x00\x00" * 256) * 256
+    png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 256, 256, 8, 2, 0, 0, 0))
     png += chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b"")
     return {"type": "image", "mime_type": "image/png", "data": base64.b64encode(png).decode()}
 
@@ -143,8 +158,9 @@ def suite(session, features):
             "type": "object", "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}},
             "required": ["a", "b"], "additionalProperties": False}}]
         history = [message("Use the add tool for 2 + 3. After the result, reply with exactly 5.")]
+        choice = {"type": "tool" if session.provider == "anthropic" else "function", "name": "add"}
         response, events = session.call("tool_call", history, tools=tools,
-                                        options={"tool_choice": {"type": "function", "name": "add"}})
+                                        options={"tool_choice": choice})
         calls = [block for block in response["message"]["content"] if block["type"] == "tool_call"]
         assert response["finish_reason"] == "tool_calls" and len(calls) == 1, "expected one tool call"
         call = calls[0]
@@ -153,26 +169,40 @@ def suite(session, features):
         history += [response["message"], {"role": "user", "content": [
             {"type": "tool_result", "id": call["id"], "output": "5"}]}]
         response, _ = session.call("tool_replay", history, tools=tools,
-                                   options={"tool_choice": "none"})
+                                   options={"tool_choice": {"type": "none"} if session.provider == "anthropic" else "none"})
         assert text(response).strip() == "5", "tool replay response mismatch"
         passed.append("tool_round_trip")
     if "image" in features:
         prompt = message("What is the solid color in this image? Answer with one color word.")
         prompt["content"].append(image())
         response, _ = session.call("image", [prompt])
-        assert "red" in text(response).lower(), "image color mismatch"
+        assert "red" in text(response).lower(), "image color mismatch: " + text(response)[:120]
         passed.append("image")
     if "reasoning" in features:
-        response, _ = session.call("reasoning", [message("What is 17 times 19? Reply with just the answer.")],
-                                   max_tokens=768, options={"reasoning": {"effort": "low"}})
-        assert text(response).strip() == "323", "reasoning answer mismatch"
+        anthropic = session.provider == "anthropic"
+        options = ({"thinking": {"type": "enabled", "budget_tokens": 1024}}
+                   if anthropic else {"reasoning": {"effort": "low"}})
+        if anthropic and session.adaptive_thinking:
+            options = {"thinking": {"type": "adaptive"}, "output_config": {"effort": "medium"}}
+        if session.provider == "codex":
+            options["reasoning"]["summary"] = "auto"
+        limit = 2048 if session.provider == "openrouter" else 1536 if anthropic else 1024
+        question = ("How many integers n from 1 through 1000000 satisfy n mod 7 = 3, "
+                    "n mod 11 = 5, and n mod 13 = 7, but are not divisible by 5? "
+                    "Return only the count as an integer.")
+        expected = sum(n % 7 == 3 and n % 11 == 5 and n % 13 == 7 and n % 5 != 0
+                       for n in range(1, 1000001))
+        response, _ = session.call("reasoning", [message(question)], max_tokens=limit, options=options)
+        assert int(text(response).strip().strip("*`")) == expected, "reasoning answer mismatch: " + text(response)[:120]
         native = response["message"]["replay"]["data"]
-        assert any(item.get("type") == "reasoning" for item in native), "no native reasoning item"
-        history = [message("What is 17 times 19? Reply with just the answer."), response["message"],
+        blocks = native["content"] if anthropic else native
+        has_reasoning = any(item.get("type") == ("thinking" if anthropic else "reasoning") for item in blocks)
+        print(json.dumps({"provider": session.provider, "native_reasoning_present": has_reasoning}))
+        assert has_reasoning, "no native reasoning item"
+        history = [message(question), response["message"],
                    message("Add 1 to that answer. Reply with just the answer.")]
-        response, _ = session.call("reasoning_replay", history, max_tokens=768,
-                                   options={"reasoning": {"effort": "low"}})
-        assert text(response).strip() == "324", "reasoning replay mismatch"
+        response, _ = session.call("reasoning_replay", history, max_tokens=limit, options=options)
+        assert int(text(response).strip().strip("*`")) == expected + 1, "reasoning replay mismatch"
         passed.append("reasoning_round_trip")
     print(json.dumps({"provider": session.provider, "passed": passed}))
 
@@ -181,13 +211,24 @@ def diagnose(env, provider, model):
     host, variable = {
         "openai": ("https://api.openai.com/v1/responses", "OPENAI_API_KEY"),
         "openrouter": ("https://openrouter.ai/api/v1/responses", "OPENROUTER_API_KEY"),
+        "anthropic": ("https://api.anthropic.com/v1/messages", "ANTHROPIC_API_KEY"),
+        "codex": ("https://chatgpt.com/backend-api/codex/responses", "CODEX_ACCESS_TOKEN"),
     }[provider]
     body = {"model": model, "input": [{"role": "user", "content": [
         {"type": "input_text", "text": "Reply with exactly LIVE_OK."}]}],
         "instructions": "", "tools": [], "max_output_tokens": 256,
         "stream": True, "store": False, "include": ["reasoning.encrypted_content"]}
-    request = urllib.request.Request(host, data=json.dumps(body).encode(), headers={
-        "Authorization": "Bearer " + env[variable], "Content-Type": "application/json"})
+    headers = {"Authorization": "Bearer " + env[variable], "Content-Type": "application/json"}
+    if provider == "anthropic":
+        headers = {"x-api-key": env[variable], "anthropic-version": "2023-06-01", "Content-Type": "application/json"}
+        body = {"model": model, "messages": [{"role": "user", "content": "Reply with exactly LIVE_OK."}],
+                "max_tokens": 256, "stream": True}
+    if provider == "codex":
+        headers.update({"chatgpt-account-id": env["CODEX_ACCOUNT_ID"], "originator": "llm-api",
+                        "OpenAI-Beta": "responses=experimental", "Accept": "text/event-stream"})
+        body.pop("max_output_tokens")
+        body.update({"instructions": "You are a helpful assistant.", "reasoning": {"effort": "low"}})
+    request = urllib.request.Request(host, data=json.dumps(body).encode(), headers=headers)
     kinds = []
     with urllib.request.urlopen(request, timeout=30) as response:
         for line in response:
@@ -202,7 +243,7 @@ def diagnose(env, provider, model):
                 error = event.get("error") or event.get("response", {}).get("error")
                 safe = json.dumps({"event": event.get("type"), "error": error,
                                    "top_level_keys": list(event)})
-                for variable in ("OPENAI_API_KEY", "OPENROUTER_API_KEY"):
+                for variable in ("OPENAI_API_KEY", "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "CODEX_ACCESS_TOKEN", "CODEX_ACCOUNT_ID"):
                     if env.get(variable):
                         safe = safe.replace(env[variable], "[REDACTED]")
                 print(safe[:1500])
@@ -213,13 +254,13 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--list", action="store_true")
     parser.add_argument("--diagnose", action="store_true")
-    parser.add_argument("--provider", choices=["openai", "openrouter"])
+    parser.add_argument("--provider", choices=["openai", "anthropic", "openrouter", "codex"])
     parser.add_argument("--model")
     parser.add_argument("--features", default="text,json,tools,image,reasoning")
     args = parser.parse_args()
     env = environment()
     if args.list:
-        catalog(env)
+        catalog(env, args.provider)
         return
     if not args.provider or not args.model:
         parser.error("--provider and --model are required without --list")
@@ -227,6 +268,8 @@ def main():
         matches = [entry for entry in models("openrouter", env) if entry["id"] == args.model]
         if len(matches) != 1 or not free(matches[0]):
             raise RuntimeError("refusing OpenRouter model without verified zero prompt/completion pricing and :free suffix")
+    if args.provider == "codex":
+        env = codex_session.environment(env)
     if args.diagnose:
         diagnose(env, args.provider, args.model)
         return

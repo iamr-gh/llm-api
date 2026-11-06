@@ -50,18 +50,17 @@ fn anthropic(stop: &str) -> Vec<Value> {
     ]
 }
 
-fn gemini(name: &str, stop: &str) -> Vec<Value> {
-    vec![
-        json!({"candidates":[{"content":{"role":"model","parts":[{"text":"Consider","thought":true}]}}]}),
-        json!({"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":name,"args":{}},"thoughtSignature":"signed"}]},"finishReason":stop}],"usageMetadata":{"promptTokenCount":12,"candidatesTokenCount":9,"thoughtsTokenCount":4,"cachedContentTokenCount":2}}),
-    ]
+fn client(provider: Provider) -> Client {
+    match provider {
+        Provider::Codex => Client::codex("test-secret", "test-account").unwrap(),
+        _ => Client::new(provider, "test-secret"),
+    }
 }
 
 fn stream(provider: Provider) -> String {
     match provider {
-        Provider::Openai | Provider::Xai | Provider::Openrouter => sse(&responses()),
+        Provider::Openai | Provider::Codex | Provider::Openrouter => sse(&responses()),
         Provider::Anthropic => sse(&anthropic("tool_use")),
-        Provider::Gemini => sse(&gemini("weather", "STOP")),
     }
 }
 
@@ -69,9 +68,8 @@ fn stream(provider: Provider) -> String {
 fn common_inputs_map_to_all_native_formats() {
     for provider in [
         Provider::Openai,
-        Provider::Xai,
+        Provider::Codex,
         Provider::Anthropic,
-        Provider::Gemini,
         Provider::Openrouter,
     ] {
         let mut req = request();
@@ -80,11 +78,14 @@ fn common_inputs_map_to_all_native_formats() {
             .push(json!({"type":"image","mime_type":"image/png","data":"aGVsbG8="}));
         let wire = encode(provider, &req).unwrap();
         match provider {
-            Provider::Openai | Provider::Xai | Provider::Openrouter => {
-                assert_eq!(
-                    wire["input"][1]["content"][0]["image_url"],
-                    "data:image/png;base64,aGVsbG8="
-                );
+            Provider::Openai | Provider::Codex | Provider::Openrouter => {
+                assert!(wire["input"].as_array().unwrap().iter().any(|item| {
+                    item["content"].as_array().is_some_and(|content| {
+                        content
+                            .iter()
+                            .any(|block| block["image_url"] == "data:image/png;base64,aGVsbG8=")
+                    })
+                }));
                 assert_eq!(
                     wire["text"]["format"]["schema"],
                     req.json_schema.clone().unwrap()
@@ -103,20 +104,6 @@ fn common_inputs_map_to_all_native_formats() {
                 );
                 assert_eq!(wire["tools"][0]["input_schema"], req.tools[0]["parameters"]);
             }
-            Provider::Gemini => {
-                assert_eq!(
-                    wire["contents"][0]["parts"][1]["inlineData"]["data"],
-                    "aGVsbG8="
-                );
-                assert_eq!(
-                    wire["generationConfig"]["responseJsonSchema"],
-                    req.json_schema.clone().unwrap()
-                );
-                assert_eq!(
-                    wire["tools"][0]["functionDeclarations"][0]["name"],
-                    "weather"
-                );
-            }
         }
     }
 }
@@ -125,9 +112,8 @@ fn common_inputs_map_to_all_native_formats() {
 fn normalized_tools_usage_and_reasoning_round_trip() {
     for provider in [
         Provider::Openai,
-        Provider::Xai,
+        Provider::Codex,
         Provider::Anthropic,
-        Provider::Gemini,
         Provider::Openrouter,
     ] {
         let mut events = Vec::new();
@@ -167,8 +153,10 @@ fn normalized_tools_usage_and_reasoning_round_trip() {
         });
         let wire = encode(provider, &req).unwrap();
         match provider {
-            Provider::Openai | Provider::Xai | Provider::Openrouter => {
-                assert_eq!(wire["input"][1]["encrypted_content"], "opaque")
+            Provider::Openai | Provider::Codex | Provider::Openrouter => {
+                assert!(wire["input"].as_array().unwrap().iter().any(|item| {
+                    item["type"] == "reasoning" && item["encrypted_content"] == "opaque"
+                }))
             }
             Provider::Anthropic => {
                 assert_eq!(
@@ -177,10 +165,6 @@ fn normalized_tools_usage_and_reasoning_round_trip() {
                 );
                 assert_eq!(wire["messages"][2]["content"][0]["tool_use_id"], call["id"]);
             }
-            Provider::Gemini => assert_eq!(
-                wire["contents"][1]["parts"][1]["thoughtSignature"],
-                "signed"
-            ),
         }
         req.model = "other-model".into();
         assert!(encode(provider, &req).is_err());
@@ -206,59 +190,6 @@ fn truncation_and_safety_never_become_successful_tool_calls() {
             }
         );
     }
-    for reason in ["MAX_TOKENS", "SAFETY"] {
-        let result = decode(
-            Provider::Gemini,
-            "test-model",
-            Cursor::new(sse(&gemini("weather", reason))),
-            |_| true,
-        )
-        .unwrap();
-        assert_eq!(
-            result.finish_reason,
-            if reason == "MAX_TOKENS" {
-                "length"
-            } else {
-                reason
-            }
-        );
-    }
-}
-
-#[test]
-fn gemini_tool_results_match_preceding_calls_not_future_calls() {
-    let mut req = request();
-    for name in ["weather", "clock"] {
-        let result = decode(
-            Provider::Gemini,
-            "test-model",
-            Cursor::new(sse(&gemini(name, "STOP"))),
-            |_| true,
-        )
-        .unwrap();
-        let id = result
-            .message
-            .content
-            .iter()
-            .find(|b| b["type"] == "tool_call")
-            .unwrap()["id"]
-            .clone();
-        req.messages.push(result.message);
-        req.messages.push(Message {
-            role: "user".into(),
-            content: vec![json!({"type":"tool_result","id":id,"output":"ok"})],
-            replay: None,
-        });
-    }
-    let wire = encode(Provider::Gemini, &req).unwrap();
-    assert_eq!(
-        wire["contents"][2]["parts"][0]["functionResponse"]["name"],
-        "weather"
-    );
-    assert_eq!(
-        wire["contents"][4]["parts"][0]["functionResponse"]["name"],
-        "clock"
-    );
 }
 
 #[test]
@@ -273,7 +204,7 @@ fn responses_preserve_mixed_block_order() {
         ],
         replay: None,
     }];
-    for provider in [Provider::Openai, Provider::Xai] {
+    for provider in [Provider::Openai, Provider::Codex] {
         let wire = encode(provider, &req).unwrap();
         assert_eq!(wire["input"][0]["content"][0]["text"], "before");
         assert_eq!(wire["input"][1]["type"], "function_call");
@@ -299,9 +230,8 @@ fn sse_supports_comments_crlf_bom_multiline_and_eof_dispatch() {
 fn malformed_truncated_and_error_streams_fail_closed() {
     for provider in [
         Provider::Openai,
-        Provider::Xai,
+        Provider::Codex,
         Provider::Anthropic,
-        Provider::Gemini,
         Provider::Openrouter,
     ] {
         assert!(decode(provider, "test-model", Cursor::new(""), |_| true).is_err());
@@ -339,9 +269,8 @@ fn malformed_truncated_and_error_streams_fail_closed() {
 fn callback_can_cancel() {
     for provider in [
         Provider::Openai,
-        Provider::Xai,
+        Provider::Codex,
         Provider::Anthropic,
-        Provider::Gemini,
         Provider::Openrouter,
     ] {
         let error = decode(
@@ -385,8 +314,6 @@ fn invalid_inputs_and_endpoint_authorities_are_rejected() {
     assert!(encode(Provider::Openai, &req).is_err());
     req.messages[0].content = vec![json!({"type":"reasoning","text":"thought"})];
     assert!(encode(Provider::Anthropic, &req).is_err());
-    req.options.insert("generationConfig".into(), json!(false));
-    assert!(encode(Provider::Gemini, &req).is_err());
 }
 
 fn serve(body: String, status: &str) -> (String, thread::JoinHandle<(String, Value)>) {
@@ -428,16 +355,24 @@ fn serve(body: String, status: &str) -> (String, thread::JoinHandle<(String, Val
 fn actual_http_transport_for_every_provider() {
     for provider in [
         Provider::Openai,
-        Provider::Xai,
+        Provider::Codex,
         Provider::Anthropic,
-        Provider::Gemini,
         Provider::Openrouter,
     ] {
         let (endpoint, server) = serve(stream(provider), "200 OK");
-        let response = Client::new(provider, "test-secret")
+        let mut req = request();
+        if provider == Provider::Codex {
+            req.options = serde_json::from_value(json!({
+                "max_output_tokens":99, "store":true, "stream":false,
+                "instructions":"", "tool_choice":"none", "parallel_tool_calls":false,
+                "text":{"verbosity":"high"}
+            }))
+            .unwrap();
+        }
+        let response = client(provider)
             .with_endpoint(endpoint)
             .unwrap()
-            .run(&request(), |_| true)
+            .run(&req, |_| true)
             .unwrap();
         assert_eq!(response.finish_reason, "tool_calls");
         let (headers, body) = server.join().unwrap();
@@ -447,13 +382,24 @@ fn actual_http_transport_for_every_provider() {
                 assert!(lower.contains("x-api-key: test-secret"));
                 assert!(lower.contains("anthropic-version: 2023-06-01"));
             }
-            Provider::Gemini => {
-                assert!(lower.contains("x-goog-api-key: test-secret"));
-                assert!(headers.contains("/test-model:streamGenerateContent?alt=sse"));
+            Provider::Codex => {
+                assert!(lower.contains("authorization: bearer test-secret"));
+                assert!(lower.contains("chatgpt-account-id: test-account"));
+                assert!(lower.contains("originator: llm-api"));
+                assert!(lower.contains("openai-beta: responses=experimental"));
+                assert!(lower.contains("accept: text/event-stream"));
+                assert!(body.get("max_output_tokens").is_none());
+                assert_eq!(body["store"], false);
+                assert_eq!(body["stream"], true);
+                assert_eq!(body["tool_choice"], "none");
+                assert_eq!(body["parallel_tool_calls"], true);
+                assert_eq!(body["text"]["verbosity"], "high");
+                assert!(!body["instructions"].as_str().unwrap().trim().is_empty());
             }
             _ => assert!(lower.contains("authorization: bearer test-secret")),
         }
         assert!(!body.to_string().contains("test-secret"));
+        assert!(!body.to_string().contains("test-account"));
     }
 }
 

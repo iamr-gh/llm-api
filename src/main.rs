@@ -20,14 +20,20 @@ fn write_event(event: &Value) -> io::Result<()> {
 }
 
 fn run(command: Command) -> Result<()> {
-    let variable = match command.provider {
-        Provider::Openai => "OPENAI_API_KEY",
-        Provider::Anthropic => "ANTHROPIC_API_KEY",
-        Provider::Xai => "XAI_API_KEY",
-        Provider::Gemini => "GEMINI_API_KEY",
-        Provider::Openrouter => "OPENROUTER_API_KEY",
+    let mut client = if command.provider == Provider::Codex {
+        Client::codex(
+            std::env::var("CODEX_ACCESS_TOKEN")?,
+            std::env::var("CODEX_ACCOUNT_ID")?,
+        )?
+    } else {
+        let variable = match command.provider {
+            Provider::Openai => "OPENAI_API_KEY",
+            Provider::Anthropic => "ANTHROPIC_API_KEY",
+            Provider::Openrouter => "OPENROUTER_API_KEY",
+            Provider::Codex => unreachable!(),
+        };
+        Client::new(command.provider, std::env::var(variable)?)
     };
-    let mut client = Client::new(command.provider, std::env::var(variable)?);
     if let Some(endpoint) = command.endpoint {
         client = client.with_endpoint(endpoint)?;
     }

@@ -1,60 +1,74 @@
 # Live verification
 
-Observed on November 4, 2026. Tests used synthetic prompts and a generated 32×32 red PNG. No keys, authorization headers, or raw replay payloads are recorded here. Credentials were read from the local, Git-ignored `.env` file.
+Latest verification, November 5, 2026. Scope is OpenAI, Anthropic, and OpenRouter API keys, plus a separate Codex subscription mode. Tests use synthetic prompts and generated images. No secrets, authorization headers, account IDs, or raw replay payloads are recorded here.
 
-## Results
+## Current results
 
-| Provider/model | Result | Boundary |
-| --- | --- | --- |
-| OpenRouter `nvidia/nemotron-3.5-super-vl:free` | Passed all five feature checks across seven generation requests | Catalog prompt/completion pricing was zero; every request in the final suite reported native cost `0` |
-| OpenAI `gpt-5.4-nano` | Generation blocked by account balance | Authenticated model listing succeeded; generation returned `insufficient_quota` / `credit_balance_exhausted` |
-| Anthropic, Gemini, xAI | Not live tested | Offline fixtures only; no credentials supplied for these providers |
+Every mode passed text streaming, JSON-schema answer output, function calling and tool-result replay, image input, and native reasoning with conversation replay. These are model-specific smoke checks, not full API conformance or comprehensive schema validation.
 
-The successful OpenRouter run used 887 reported input tokens and 487 output tokens in total, with a summed reported cost of `0.0`. Earlier OpenRouter diagnostics also used only the same verified free model. OpenAI was not retried after confirming the quota failure. Its generated-output compatibility remains unverified.
+| Mode | Model | Result | Credentials |
+| --- | --- | --- | --- |
+| OpenAI API | `gpt-5.4-nano` | All feature checks passed across targeted runs | `.env` API key |
+| Anthropic API | `claude-haiku-5-5` | All feature checks passed across targeted runs | `.env` API key |
+| OpenRouter | `nvidia/nemotron-3.5-super-vl:free` | All feature checks passed; every generation reported cost `0` | `.env` API key |
+| Codex subscription | `gpt-6.1-sol` | All feature checks passed using the active fx login | Read-only fx access-token/account-ID bridge |
 
-### OpenRouter assertions
+The OpenAI credit-exhaustion blocker recorded on November 4 is resolved with the current key. Model choices were checked against authenticated catalogs. Anthropic's current Haiku capability metadata requires adaptive thinking rather than `thinking.type: enabled`; the live runner consults this metadata. Codex model discovery uses the same backend catalog and client-version query pattern found in the fx source.
 
-| Check | Actual assertion | Final finish reason |
-| --- | --- | --- |
-| Text streaming | Exact `LIVE_OK` answer and incremental text event | `stop` |
-| Structured JSON | Parsed answer equals `{"ok": true}` with the supplied strict schema | `stop` |
-| Tool call | One `add` call with object arguments `{"a": 2, "b": 3}` and streamed argument deltas | `tool_calls` |
-| Tool replay | Append untouched native replay plus matching tool result, receive exact `5` | `stop` |
-| Image | Identify the generated red PNG as red | `stop` |
-| Reasoning | Exact `323` answer and a native reasoning item | `stop` |
-| Reasoning replay | Append the returned message and follow-up, receive exact `324` | `stop` |
+### Usage this round
 
-These are smoke checks, not a comprehensive provider conformance test or proof that every schema constraint is enforced. Model capabilities and free-model availability can change.
+Counts include successful generation responses whose test assertions initially failed, not just final passing assertions. Catalog requests are not generation requests. Counts differ in semantics by provider, and the normalized fields are not a billing calculation.
 
-## Bug found and fixed
+| Mode | Generation requests | Reported input tokens | Reported output tokens | Reported dollar cost |
+| --- | ---: | ---: | ---: | --- |
+| OpenAI API | 8 | 484 | 742 | Not supplied by the response |
+| Anthropic API | 9 | 2,292 | 1,446 | Not supplied by the response |
+| OpenRouter free | 9 | 1,064 | 1,805 | `0.0` |
+| Codex subscription | 8 | 616 | 199 | Not supplied; subscription quota applies |
 
-OpenRouter's Responses output can carry visible reasoning under a `reasoning` item's `content` array, rather than only under `summary`. The initial client classified that content as answer text, contaminating otherwise-valid JSON answers. Streaming answer text itself was correct.
+No paid OpenRouter model or fallback was used. Exact OpenAI/Anthropic charges require the providers' billing records; they are not inferred from missing cost fields.
 
-The shared Responses adapter now classifies reasoning content separately and recognizes `response.reasoning_text.delta` as a normalized `reasoning_delta`. Native replay remains intact. `tests/responses_reasoning.rs` reproduces the original failure and passes after the fix. All 22 offline tests pass. Production Rust remains below the requested bound at 694 physical lines after formatting.
+## Assertions and adjustments
 
-## Reproduce
+- Text must include an incremental `text_delta` and the exact synthetic answer `LIVE_OK`.
+- JSON-schema output must parse to `{"ok": true}`.
+- Tool tests require one streamed `add` call with arguments `{"a": 2, "b": 3}`. Replaying the untouched assistant message plus its matching tool result must produce `5`.
+- Image tests identify a generated solid-red PNG. OpenAI Nano did not satisfy the color assertion on the initial 32×32 fixture; the 256×256 fixture passed. The other modes passed the original small fixture. No image-encoding change was needed.
+- Adaptive reasoning is not guaranteed to emit thoughts for trivial arithmetic. Haiku and Codex answered the initial `17 * 19` question without a reasoning item, which is legitimate behavior rather than an adapter failure.
+- The final reasoning check counts numbers in `1..=1,000,000` satisfying three modular constraints and excluding multiples of five. The expected count, independently computed in Python, is `799`; the replay follow-up must return `800`.
+- All four modes returned native reasoning for the nontrivial question and accepted the returned assistant replay on the follow-up. Anthropic's first correct answer was formatted as `**799**`; the numeric test now tolerates a Markdown wrapper without accepting arbitrary prose. The final signed-thinking replay passed.
 
-From the repository directory, put `OPENROUTER_API_KEY` and/or `OPENAI_API_KEY` in `.env`. The runner reads only these two assignments; it does not execute the file. Do not put keys in commands or checked-in files.
+Initial image/reasoning assertions exited `1` as described above. The targeted follow-up commands below all exited `0`.
+
+## Reproduce the successful targeted checks
+
+Build first, with keys in the local Git-ignored `.env`. The test runner reads only the three API-key assignments and does not execute the file.
 
 ```sh
 cargo build --release --locked --offline
-python3 tests/live.py --list
-python3 -u tests/live.py --provider openrouter --model nvidia/nemotron-3.5-super-vl:free
+python3 -u tests/live.py --provider openai --model gpt-5.4-nano --features text
+python3 -u tests/live.py --provider openai --model gpt-5.4-nano --features image,reasoning
+python3 -u tests/live.py --provider anthropic --model claude-haiku-5-5 --features text
+python3 -u tests/live.py --provider anthropic --model claude-haiku-5-5 --features reasoning
+python3 -u tests/live.py --provider codex --model gpt-6.1-sol --features text
+python3 -u tests/live.py --provider codex --model gpt-6.1-sol --features reasoning
+python3 -u tests/live.py --provider openrouter --model nvidia/nemotron-3.5-super-vl:free --features text
+python3 -u tests/live.py --provider openrouter --model nvidia/nemotron-3.5-super-vl:free --features reasoning
 ```
 
-The final OpenRouter command exited `0`. The runner verifies a `:free` suffix and zero catalog prompt/completion prices before permitting any OpenRouter generation. It never selects a paid fallback. If this model is unavailable, inspect `--list` and explicitly select another free model with the required capabilities.
+The larger `--features json,tools,image,reasoning` runs established the JSON/tool/image results for the other cases before encountering the assertion issues documented above. The OpenRouter larger run exited `0`. To rerun all checks with the updated fixtures, omit `--features`; expect seven requests per mode, with charges for API-key modes other than the verified free OpenRouter model.
 
-After funding the OpenAI account, retry the low-cost model explicitly. This command can incur charges and was blocked during this verification:
+Use `--list --provider openai`, `anthropic`, `openrouter`, or `codex` for catalog discovery without generation. OpenRouter generation is refused unless the selected catalog entry has a `:free` suffix and zero prompt/completion prices. Model availability can change.
 
-```sh
-python3 -u tests/live.py --provider openai --model gpt-5.4-nano
-```
+### Subscription boundary
 
-The OpenAI smoke command exited `1`. An additional `--diagnose` request confirmed `credit_balance_exhausted`; the diagnostic command itself exited `0` because it successfully inspected the stream, not because generation succeeded.
+The crate does not discover or refresh subscription credentials. `tests/codex_session.py` is an explicit read-only bridge for these live tests. It reads `FX_HOME/chatgpt-auth.json` or `~/.fx/chatgpt-auth.json`, verifies a private user-owned regular file and non-expired version-1 session, and supplies `CODEX_ACCESS_TOKEN` and `CODEX_ACCOUNT_ID` only to the child environment. It does not print, persist, rotate, or refresh tokens, and no subscription credentials are copied into `.env` or repository files. If near expiry, refresh the login in fx first.
 
-Use `--features text`, `--features json,tools`, or another subset to limit requests. `--diagnose` sends a single short synthetic text request directly to the Responses endpoint to report sanitized provider errors and event types. Diagnostics are separate from the library's intentionally payload-free errors. Neither mode runs during `cargo test`.
+Codex rejects `max_output_tokens`; the client strips it even from native options. Consequently common `max_tokens` is not a subscription generation cap. The smoke tests use short prompts and low reasoning effort, subject to the server's model limits, request timeout, and client cancellation.
 
-Offline verification after the fix, all exit `0`:
+## Deterministic verification
+
+All exit `0` after narrowing scope and adding subscription support:
 
 ```sh
 cargo test --locked --offline
@@ -62,4 +76,6 @@ cargo clippy --locked --offline --all-targets -- -D warnings
 cargo build --release --locked --offline
 ```
 
-The test runner uses only Python's standard library. `python3 -m py_compile tests/live.py` also passed. Actual live results are scoped to this model and credential/account state, not the entire five-provider API surface.
+There are 30 deterministic Rust tests, including subscription headers/body constraints, terminal status handling, finalized streamed-item recovery, replay, and local HTTP transport for all four modes. Formatted production Rust is 694 physical lines. Python live helpers use only the standard library and passed `py_compile`; no live calls run under `cargo test`.
+
+The November 4 OpenRouter reasoning-content classification fix remains covered by `tests/responses_reasoning.rs`. Existing offline and live tests are evidence for their exercised cases, not a security audit or a guarantee of compatibility with every model.

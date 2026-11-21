@@ -7,6 +7,9 @@ use std::sync::{
 };
 use std::time::Duration;
 
+mod quota;
+pub use quota::CodexQuota;
+
 /// Cancellation never returns a partial response. Already emitted deltas are provisional.
 #[derive(Debug)]
 pub struct Cancelled;
@@ -205,6 +208,28 @@ impl Client {
         let mut response = call.send(bytes.as_slice())?;
         if !response.status().is_success() {
             let status = response.status();
+            if self.provider == Provider::Codex && status.as_u16() == 429 {
+                let retry_after = response
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse().ok());
+                const MAX_ERROR: u64 = 16 * 1024;
+                let mut body = Vec::new();
+                let read = response
+                    .body_mut()
+                    .as_reader()
+                    .take(MAX_ERROR + 1)
+                    .read_to_end(&mut body);
+                let quota = read
+                    .ok()
+                    .filter(|n| *n as u64 <= MAX_ERROR)
+                    .and_then(|_| serde_json::from_slice(&body).ok())
+                    .and_then(|payload| CodexQuota::from_error(&payload, retry_after));
+                if let Some(quota) = quota {
+                    return Err(quota.into());
+                }
+            }
             return Err(format!("provider HTTP {status} (body omitted)").into());
         }
         let reader = BufReader::new(response.body_mut().as_reader());
@@ -446,6 +471,11 @@ pub fn decode(
         }
         let event: Value = serde_json::from_str(&data)?;
         data.clear();
+        if provider == Provider::Codex {
+            if let Some(quota) = CodexQuota::from_error(&event, None) {
+                return Err(quota.into());
+            }
+        }
         if event.get("error").is_some()
             || event["type"] == "error"
             || event["type"] == "response.failed"

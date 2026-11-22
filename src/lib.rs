@@ -20,6 +20,87 @@ impl std::fmt::Display for Cancelled {
 }
 impl std::error::Error for Cancelled {}
 
+/// Provider diagnostics omit raw payloads and free-form messages, which may echo input.
+#[derive(Debug)]
+pub struct ProviderError {
+    kind: ProviderFailure,
+    code: Option<String>,
+    retryable: bool,
+}
+
+#[derive(Debug)]
+enum ProviderFailure {
+    Http(ureq::http::StatusCode),
+    Stream,
+    Disconnected,
+}
+
+impl std::fmt::Display for ProviderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.kind {
+            ProviderFailure::Http(status) => write!(f, "provider HTTP {status}"),
+            ProviderFailure::Stream => f.write_str("provider reported a stream error"),
+            ProviderFailure::Disconnected => {
+                f.write_str("incomplete stream: missing terminal event")
+            }
+        }?;
+        if let Some(code) = &self.code {
+            write!(f, " (code: {code})")?;
+        }
+        Ok(())
+    }
+}
+impl std::error::Error for ProviderError {}
+
+impl ProviderError {
+    fn stream(event: &Value) -> Self {
+        let code = [
+            &event["response"]["error"]["code"],
+            &event["error"]["code"],
+            &event["code"],
+            &event["error"]["type"],
+        ]
+        .into_iter()
+        .filter_map(Value::as_str)
+        .find(|code| {
+            !code.is_empty()
+                && code.len() <= 64
+                && code
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        });
+        Self {
+            kind: ProviderFailure::Stream,
+            code: code.map(str::to_owned),
+            retryable: matches!(
+                code,
+                Some("server_error" | "internal_server_error" | "overloaded_error")
+            ),
+        }
+    }
+}
+
+/// A caller may retry these errors if it has not committed or displayed partial output.
+pub fn is_transient(error: &(dyn std::error::Error + 'static)) -> bool {
+    if let Some(error) = error.downcast_ref::<ProviderError>() {
+        return error.retryable;
+    }
+    let io = match error.downcast_ref::<ureq::Error>() {
+        Some(ureq::Error::Timeout(_)) => return true,
+        Some(ureq::Error::Io(io)) => Some(io),
+        _ => error.downcast_ref::<std::io::Error>(),
+    };
+    io.is_some_and(|io| {
+        matches!(
+            io.kind(),
+            std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::TimedOut
+        )
+    })
+}
+
 fn transport() -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(180)))
@@ -230,7 +311,13 @@ impl Client {
                     return Err(quota.into());
                 }
             }
-            return Err(format!("provider HTTP {status} (body omitted)").into());
+            return Err(ProviderError {
+                kind: ProviderFailure::Http(status),
+                code: None,
+                retryable: matches!(status.as_u16(), 500 | 502 | 503 | 504 | 529)
+                    && !response.headers().contains_key("retry-after"),
+            }
+            .into());
         }
         let reader = BufReader::new(response.body_mut().as_reader());
         decode(self.provider, &request.model, reader, emit)
@@ -476,11 +563,11 @@ pub fn decode(
                 return Err(quota.into());
             }
         }
-        if event.get("error").is_some()
+        if !event["error"].is_null()
             || event["type"] == "error"
             || event["type"] == "response.failed"
         {
-            return Err("provider reported a stream error (payload omitted)".into());
+            return Err(ProviderError::stream(&event).into());
         }
         let mut events = Vec::new();
         match provider {
@@ -526,9 +613,11 @@ pub fn decode(
                             _ => named,
                         };
                         let status = native["status"].as_str().unwrap_or(fallback);
+                        if !native["error"].is_null() {
+                            return Err(ProviderError::stream(&event).into());
+                        }
                         if !matches!(status, "completed" | "incomplete")
                             || named != "done" && named != status
-                            || !native["error"].is_null()
                         {
                             return Err(
                                 "provider returned a failed or conflicting terminal status".into(),
@@ -627,7 +716,12 @@ pub fn decode(
         }
     }
     if !done || stop.is_empty() {
-        return Err("incomplete stream: missing terminal event".into());
+        return Err(ProviderError {
+            kind: ProviderFailure::Disconnected,
+            code: None,
+            retryable: !done,
+        }
+        .into());
     }
     finish(provider, model, native, usage, stop)
 }

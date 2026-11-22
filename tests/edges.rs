@@ -1,4 +1,4 @@
-use llm_api::{Client, LIMIT, Provider, Request, decode, encode};
+use llm_api::{Client, LIMIT, Provider, Request, decode, encode, is_transient};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Cursor, Read, Write};
 use std::net::TcpListener;
@@ -182,4 +182,65 @@ fn redirects_are_never_followed() {
         destination.accept().unwrap_err().kind(),
         std::io::ErrorKind::WouldBlock
     );
+}
+
+#[test]
+fn stream_failures_preserve_only_safe_codes() {
+    for (provider, event, code, retryable) in [
+        (
+            Provider::Codex,
+            json!({"type":"response.failed","error":null,"response":{"error":{"code":"server_error","message":"secret input"}}}),
+            Some("server_error"),
+            true,
+        ),
+        (
+            Provider::Codex,
+            json!({"type":"error","code":"context_length_exceeded","message":"secret input"}),
+            Some("context_length_exceeded"),
+            false,
+        ),
+        (
+            Provider::Anthropic,
+            json!({"type":"error","error":{"type":"overloaded_error","message":"secret input"}}),
+            Some("overloaded_error"),
+            true,
+        ),
+        (
+            Provider::Codex,
+            json!({"type":"error","code":"secret input\u{1b}"}),
+            None,
+            false,
+        ),
+        (
+            Provider::Codex,
+            json!({"type":"response.done","response":{"status":"failed","error":{"code":"invalid_request_error","message":"secret input"}}}),
+            Some("invalid_request_error"),
+            false,
+        ),
+    ] {
+        let error = decode(provider, "test", Cursor::new(sse(&[event])), |_| {
+            panic!("failure is not a delta")
+        })
+        .unwrap_err();
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("stream error"));
+        assert!(!diagnostic.contains("secret input"));
+        assert!(!diagnostic.contains('\u{1b}'));
+        if let Some(code) = code {
+            assert!(diagnostic.contains(code));
+        }
+        assert_eq!(is_transient(error.as_ref()), retryable);
+    }
+}
+
+#[test]
+fn successful_terminal_event_can_have_null_error() {
+    let wire = sse(&[json!({"type":"response.completed","error":null,"response":{"output":[]}})]);
+    assert!(decode(Provider::Codex, "test", Cursor::new(wire), |_| true).is_ok());
+}
+
+#[test]
+fn clean_disconnect_before_completion_is_transient() {
+    let error = decode(Provider::Codex, "test", Cursor::new(""), |_| true).unwrap_err();
+    assert!(is_transient(error.as_ref()));
 }
